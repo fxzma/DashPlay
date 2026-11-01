@@ -210,6 +210,60 @@ def group(title, cells, foot=""):
     return f'<section>{head}<div class=group>{cells}</div>{tail}</section>'
 
 
+def hotspot_radio_form(nonce, data):
+    pending = data.get('pending')
+    selected = pending['candidate'] if pending else data['selected']
+    caps = data['capabilities']
+    locked = bool(data['reason'] or pending or data.get('restart') or not caps)
+    measured = data.get('actual')
+    actual_text = (f"{measured['band']} GHz · 信道 {measured['channel']} · {measured['width']} MHz"
+                   if measured else '暂时无法读取')
+    body = group('无线参数', '<div class="cell summary-row"><b>实际运行</b>'
+                 f'<span class=value id=radio-actual>{escape(actual_text)}</span></div>'
+                 '<div class=cell><span class=main>发射功率</span><span class=value>自动</span></div>')
+    if data['reason']:
+        body += banner(data['reason'], 'wait')
+    elif not caps:
+        body += banner('暂时无法读取无线能力，请稍后刷新。', 'wait')
+    if data.get('result') == 'reverted':
+        body += banner('已恢复原无线设置。', 'wait')
+    fields = ''
+    choices = {'band': list(caps), 'channel': list(caps.get(selected['band'], {})),
+               'width': caps.get(selected['band'], {}).get(selected['channel'], [])}
+    for key, label, suffix in [('band', '频段', ' GHz'), ('channel', '信道', ''), ('width', '频宽', ' MHz')]:
+        options = ''.join(f'<option value="{value}"{" selected" if str(value) == str(selected[key]) else ""}>'
+                          f'{value}{suffix}</option>' for value in choices[key])
+        fields += (f'<label class=cell><span class=main>{label}</span><select id=radio-{key} name={key} '
+                   f'aria-label="{label}" required{" disabled" if locked else ""}>{options}</select></label>')
+    body += (f'<form method=post action=/hotspot-radio>{hidden(nonce)}<div class=group>{fields}</div>'
+             f'<button class=btn id=radio-apply{" disabled" if locked else ""}>应用无线设置</button></form>'
+             '<p class=foot>切换会暂时断开热点和 CarPlay。重新连接后请在 3 分钟内确认，超时自动恢复。</p>')
+    if pending:
+        ready = measured and all(measured.get(k) == v for k, v in pending['candidate'].items())
+        body += (f'<p class="banner wait" id=radio-remaining>待确认，剩余 {data["remaining"]} 秒</p>'
+                 f'<form method=post action=/hotspot-radio/confirm>{hidden(nonce, transaction=pending["id"])}'
+                 f'<button class=btn id=radio-confirm{"" if ready else " disabled"}>确认保留</button></form>'
+                 f'<form method=post action=/hotspot-radio/restore>{hidden(nonce, transaction=pending["id"])}'
+                 '<button class="btn plain">恢复原设置</button></form>')
+    initial = json.dumps(dict(caps=caps, nonce=nonce, pending=pending['id'] if pending else None,
+                              selected=selected), ensure_ascii=True).replace('<', '\\u003c')
+    body += '<style>select{font:inherit;color:inherit;background:var(--cell);max-width:55%;border:0;padding:4px}button:disabled{opacity:.45;cursor:default}</style>'
+    body += '<script>(function(){var initial=' + initial + r''';
+var band=document.getElementById('radio-band'),channel=document.getElementById('radio-channel'),width=document.getElementById('radio-width');
+function fill(el,values,suffix){var old=el.value;el.innerHTML='';values.forEach(function(v){var o=document.createElement('option');o.value=v;o.textContent=v+suffix;el.appendChild(o)});if(values.map(String).indexOf(old)>=0)el.value=old;}
+function widths(){fill(width,((initial.caps[band.value]||{})[channel.value]||[]),' MHz');}
+band.onchange=function(){fill(channel,Object.keys(initial.caps[band.value]||{}),'');widths()};channel.onchange=widths;
+async function poll(){var controller=new AbortController(),timer=setTimeout(function(){controller.abort()},4000);
+try{var response=await fetch('/hotspot-radio/status',{cache:'no-store',signal:controller.signal});if(!response.ok)throw Error();var d=await response.json();
+if(d.nonce!==initial.nonce||((d.pending||{}).id||null)!==initial.pending){location.replace('/?view=hotspot');return;}
+var a=d.actual;document.getElementById('radio-actual').textContent=a?a.band+' GHz · 信道 '+a.channel+' · '+a.width+' MHz':'暂时无法读取';
+var confirm=document.getElementById('radio-confirm');if(confirm){var c=d.pending.candidate;confirm.disabled=!!d.reason||!a||a.band!==c.band||a.channel!==c.channel||a.width!==c.width||d.remaining<=0;document.getElementById('radio-remaining').textContent='待确认，剩余 '+d.remaining+' 秒';}
+}catch(e){document.getElementById('radio-actual').textContent='连接中，请保持连接盒子热点';var b=document.getElementById('radio-confirm');if(b)b.disabled=true;}
+finally{clearTimeout(timer);setTimeout(poll,5000);}}
+setTimeout(poll,5000);})();</script>'''
+    return body
+
+
 def scanning(label):
     """Shown while the box scans for hotspots on its own thread; the page reloads every SCANNING_RELOAD s."""
     return (f'<div class=group><div class="cell scanning" role=status><span class=spinner aria-hidden=true></span>'

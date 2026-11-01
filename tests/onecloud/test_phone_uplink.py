@@ -434,9 +434,7 @@ class UsbShareUplinkTests(unittest.TestCase):
         self.assertEqual(u.phase, 'wired')
         self.assertEqual(u.channel, 149)
 
-    def test_an_ap_already_on_five_ghz_is_left_alone(self):
-        # Owner's rule (2026-10-31): only an AP that followed the hotspot onto 2.4 GHz moves back; one that
-        # is already on 5 GHz must not be restarted for nothing.
+    def test_five_ghz_ap_restores_saved_width_on_usb_return(self):
         u = self.uplink(share=True)
         self.p.phone_hotspot_frequency.return_value = 5745
         self.assertTrue(u.start())
@@ -451,7 +449,12 @@ class UsbShareUplinkTests(unittest.TestCase):
         u.tick()
         self.assertEqual(u.phase, 'wired')
         self.assertEqual(u.channel, 149)
-        self.p.stop_child.assert_not_called()
+        self.assertEqual(u.width, 40)
+        self.p.stop_child.assert_any_call('hostapd')
+        self.p.stop_child.reset_mock()
+        self.now = u.next_try
+        u.tick()
+        self.p.stop_child.assert_not_called()  # already matches: no needless rebuild
 
     def test_the_cable_coming_back_leaves_the_phone_hotspot(self):
         u = self.uplink(share=True)
@@ -467,7 +470,8 @@ class UsbShareUplinkTests(unittest.TestCase):
         u.tick()
         self.assertEqual(u.phase, 'wired')
         self.p.stop_phone_station.assert_called_once()
-        self.p.stop_child.assert_not_called()   # the AP, dnsmasq and the receiver stay up
+        self.assertEqual((u.channel, u.width), (149, 40))
+        self.assertNotIn(('dnsmasq',), [c.args for c in self.p.stop_child.call_args_list])
 
     def test_without_share_the_hotspot_stays_when_a_cable_appears(self):
         u = self.uplink(share=False)
@@ -906,6 +910,7 @@ class UsbTetherPlatformTests(unittest.TestCase):
                                 self.root / 'nm/tether.nmconnection')
 
     nm_running = False
+
 
     def run_fake(self, *args, **kwargs):
         if args[0][:2] == ['systemctl', 'is-active']:

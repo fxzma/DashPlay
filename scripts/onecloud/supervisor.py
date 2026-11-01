@@ -35,6 +35,7 @@ import traceback
 from boxnet import ensure_leaf
 import debug_uplink
 from phone_uplink import PhoneUplink, LegacyPhoneUplink, JoinedPhoneAP, UnsuitableChannel
+import hotspot_radio
 import board_phicomm_n1
 from mdns_name import NameResponder
 import viewer_port
@@ -228,7 +229,7 @@ def main():
             "passphrase" in hotspot and not 8 <= len(hotspot["passphrase"]) <= 63):
         raise ValueError("Invalid hotspot credentials")
     for relative in ["run-receiver.py", "phone-presence.py", "pair-phone.py", "pairing_window.py", "setup_wizard.py",
-                     "settings_ui.py", "mdns_name.py", "debug_uplink.py", "status_light.py", "platform_api.py", "platform_debian.py", "diagnostics.py", "iphone-usb-bridge.py", "linux-bt-bridge/bt-bridge"]:
+                     "settings_ui.py", "hotspot_radio.py", "mdns_name.py", "debug_uplink.py", "status_light.py", "platform_api.py", "platform_debian.py", "diagnostics.py", "iphone-usb-bridge.py", "linux-bt-bridge/bt-bridge"]:
         if not (root / relative).is_file():
             raise RuntimeError("Missing runtime input: " + relative)
     identity = [root / "identity/offline-mfi/identity.pk8", root / "identity/offline-mfi/certificate.p7b"]
@@ -244,6 +245,11 @@ def main():
     os.umask(0o077)
     RUN.mkdir(mode=0o700, exist_ok=True)
     state = root / "state"
+    radio_store = hotspot_radio.system_store(root)
+    if radio_store.recover():
+        print('hotspot radio: restored unconfirmed settings', flush=True)
+    radio_choice = radio_store.effective()
+    channel, width = radio_choice['channel'], radio_choice['width']
     if interface == "auto":
         for _ in range(60):   # the unit may start before udev has named the dongle
             # The kernel's "wlan0" is renamed to wlx<MAC> moments later; taking the old name made the
@@ -385,6 +391,7 @@ def main():
     maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
     settings = SettingsPage(state, lambda: status, on_settings_change, lambda: [ip.network for ip in platform.local_addresses()],
                             scanner, WIRED_STATUS, run=RUN,
+                            radio=hotspot_radio.Radio(radio_store, lambda: platform.ap_interface),
                             retry_cert=lambda: [worker.request_retry() for worker in list(maintainer)])
     uplink = None
     direct_ap = None
@@ -596,6 +603,7 @@ def main():
                 # usb_tether shares the uplink with the car (share=True) and keeps the AP while it joins.
                 uplink = PhoneUplink(platform, state, address, hotspot, channel, width, wait_for,
                                      launch_receiver, status, share=wants_usb_tether,
+                                     radio_pending=lambda: bool(radio_store.snapshot().get('pending')),
                                      say=lambda line: print(line, flush=True))
                 if not uplink.start():
                     uplink = None

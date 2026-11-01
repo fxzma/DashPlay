@@ -266,13 +266,17 @@ class PhoneUplink:
     so an autonomous reconnect cannot silently move the AP to another channel.
     """
     def __init__(self, platform, state, address, box, offline_channel, offline_width,
-                 wait_for, start_receiver, status, say=print, clock=time.monotonic, share=False):
+                 wait_for, start_receiver, status, say=print, clock=time.monotonic, share=False,
+                 radio_pending=lambda: False):
         self.platform, self.state, self.address, self.box = platform, Path(state), address, box
         self.channel, self.width = offline_channel, offline_width
         # share: the box is the car's router and forwards whichever uplink is up. "USB 共享网络" uses it so the
         # car keeps the port when the cable is unplugged and the saved phone hotspot takes over (2026-10-31).
         self.share = share
         self.default_channel = offline_channel
+        self.default_width = offline_width
+        self.following = not share
+        self.radio_pending = radio_pending
         self.wait_for, self.start_receiver, self.status = wait_for, start_receiver, status
         self.say, self.clock = say, clock
         self.saved = hotspot(state)
@@ -342,14 +346,17 @@ class PhoneUplink:
         return 14 if frequency == 2484 else ((frequency - 2407) // 5 if frequency < 3000
                                             else (frequency - 5000) // 5)
 
-    def configure_ap(self, channel):
+    def configure_ap(self, channel, width=20, following=True):
         p = self.platform
-        p.configure_hotspot(channel, 20, self.box['ssid'], self.box['passphrase'])
-        p.n_only_ap()
+        p.configure_hotspot(channel, width, self.box['ssid'], self.box['passphrase'])
+        if following:
+            p.n_only_ap()
         for _ in range(2):
             if p.start_ap(self.wait_for):
                 self.channel = channel
+                self.width, self.following = width, following
                 self.status['channel'] = channel
+                self.status['uplink_following'] = following
                 return
             p.stop_child('hostapd')
         raise RuntimeError('shared hotspot failed twice')
@@ -376,7 +383,7 @@ class PhoneUplink:
             # usb_tether: no scan at all at startup. It ran before the cable's lease existed, joined the saved
             # hotspot within half a second, moved the AP and restarted the receiver (dp-0017 2026-10-31: four
             # receiver starts on one boot). After SHARE_START_GRACE the first tick decides with the cable known.
-            if not cable and not self.share:
+            if not cable and not self.share and not self.radio_pending():
                 try:
                     frequency = self.scan()
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -388,13 +395,14 @@ class PhoneUplink:
                 raise RuntimeError('cannot create persistent AP')
             p.set_ap_address(self.address)
             default_channel = self.channel
-            chosen = default_channel if cable else self.boot_channel(frequency)
+            chosen = default_channel if cable or self.share or self.radio_pending() else self.boot_channel(frequency)
+            width, following = (self.default_width, False) if self.share else (20, True)
             try:
-                self.configure_ap(chosen)
+                self.configure_ap(chosen, width, following)
             except RuntimeError:
                 if chosen == default_channel:
                     raise
-                self.configure_ap(default_channel)
+                self.configure_ap(default_channel, width, following)
                 frequency = None
             # Only Tesla uses this persistent router policy. Legacy cars retain their lifecycle.
             p.set_phone_dns(None)
@@ -445,6 +453,10 @@ class PhoneUplink:
 
     def restore_plain_ap(self):
         """Last local recovery. On success the supervisor resumes ordinary child monitoring."""
+        if self.share:
+            # Changing ap0 to wlan0 also changes USB NAT and forwarding ownership.
+            # Let the supervisor clean both journals and recreate them together.
+            raise LanRecoveryFailed('shared LAN requires full network recovery')
         try:
             self.clear_lan()
             start_shared_ap(self.platform, self.address, self.box, self.default_channel, 20,
@@ -491,23 +503,23 @@ class PhoneUplink:
         self.set_status('offline', reason)
         self.next_try = self.clock() + self.search.delay()
 
-    def rebuild_ap(self, channel):
+    def rebuild_ap(self, channel, width=20, following=True):
         """True if requested channel works; False if restored old channel or plain AP."""
         p = self.platform
-        previous = self.channel
+        previous = (self.channel, self.width, self.following)
         self.status['tesla_lan_stable'] = False
         try:
             p.stop_child('receiver')
             p.stop_child('hostapd')
             try:
-                self.configure_ap(channel)
+                self.configure_ap(channel, width, following)
                 self.start_receiver(channel)
                 p.check_lan_children()
             except NETWORK_ERRORS:
                 p.stop_child('receiver')
                 p.stop_child('hostapd')
-                self.configure_ap(previous)
-                self.start_receiver(previous)
+                self.configure_ap(*previous)
+                self.start_receiver(previous[0])
                 p.check_lan_children()
                 self.status['tesla_lan_stable'] = True
                 return False
@@ -518,6 +530,8 @@ class PhoneUplink:
         return True
 
     def connect(self, frequency):
+        if self.radio_pending():
+            return
         if not self.usable(frequency):
             if self.hidden_from_car(frequency):
                 # Quick scans look at the remembered channel: remember this one, or two tries in three said
@@ -529,7 +543,7 @@ class PhoneUplink:
             return
         try:
             channel = self.channel_of(frequency)
-            if channel != self.channel:
+            if channel != self.channel or self.width != 20 or not self.following:
                 self.disconnect_station()
                 self.say(f'phone uplink channel change: {self.channel} -> {channel}; rebuilding AP')
                 if not self.rebuild_ap(channel):
@@ -557,7 +571,7 @@ class PhoneUplink:
         if self.ap_misses >= AP_READY_MISSES:
             self.ap_misses = 0
             self.disconnect_station()
-            self.rebuild_ap(self.channel)
+            self.rebuild_ap(self.channel, self.width, self.following)
             if not self.started:
                 return
             self.set_status('offline', '盒子热点已恢复；后台重连上游')
@@ -567,14 +581,10 @@ class PhoneUplink:
         try:
             if self.station:
                 if self.share and self.cable_present():
-                    # USB 共享网络: the cable (or Ethernet) is the first choice, the joined hotspot only the
-                    # fallback. Back on the cable: leave the phone hotspot and, if the AP had followed that
-                    # hotspot onto 2.4 GHz, return it to its own (5 GHz) channel — nothing needs that channel
-                    # any more and 2.4 GHz makes CarPlay stutter (dp-0017, 2026-10-31). An AP already on 5 GHz
-                    # is left alone.
+                    # Return to the owner's complete radio selection when the cable takes over.
                     self.disconnect_station()
-                    if self.channel <= 14:
-                        self.rebuild_ap(self.default_channel)
+                    if (self.channel, self.width, self.following) != (self.default_channel, self.default_width, False):
+                        self.rebuild_ap(self.default_channel, self.default_width, False)
                     self.set_status('wired', '已接 USB 共享网络；改用数据线供网')
                     self.next_try = self.clock() + self.search.delay()
                     return
@@ -618,10 +628,12 @@ class PhoneUplink:
                 # The cable is the uplink now. An AP left on the hotspot's 2.4 GHz channel makes CarPlay
                 # stutter and nothing needs that channel any more (2026-10-31: plugging Ethernet after the
                 # hotspot had already dropped kept the AP on channel 3).
-                if self.share and self.channel <= 14:
-                    self.rebuild_ap(self.default_channel)
+                if self.share and (self.channel, self.width, self.following) != (self.default_channel, self.default_width, False):
+                    self.rebuild_ap(self.default_channel, self.default_width, False)
                 self.set_status('wired', '已接有线网络；局域网保持可用')
                 self.next_try = self.clock() + WIRED_RECHECK
+                return
+            if self.radio_pending():
                 return
             frequency = self.scan()
             if frequency:

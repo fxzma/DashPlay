@@ -142,13 +142,15 @@ def download_progress(progress):
 
 class SettingsPage:
     def __init__(self, state: Path, status, on_change, allowed_networks, scanner=None, wired_status=None,
-                 managed=None, run=None, retry_cert=None):
+                 managed=None, run=None, retry_cert=None, radio=None):
         """status() -> dict for display; on_change(reason) re-applies the configuration;
         wired_status: the receiver's wired CarPlay status file; managed: {"by": "OpenWrt", "admin": URL of
         its Wi-Fi settings} when the system, not this page, sets up the network; run: the service's runtime
         directory, which holds the remote-debugging window (debug_uplink.py; offered only with it);
         retry_cert() asks the own-domain worker to try the certificate now, without restarting the service."""
         self.managed = managed
+        self.radio = radio
+        self.apply_lock = threading.RLock()
         self.retry_cert = retry_cert
         self.run = run
         self.state = state
@@ -227,6 +229,8 @@ class SettingsPage:
                     return self._send(reply[0], reply[1], "text/html", reply[2])
                 if not self._allowed():
                     return self._send(403, "forbidden")
+                if self.path == '/hotspot-radio/status' and page.radio:
+                    return self._send(200, json.dumps(page.radio_status()), 'application/json; charset=utf-8')
                 portal = page.portal_reply(host, self.path, self.client_address[0].removeprefix("::ffff:"))
                 if portal:
                     return self._send(portal[0], portal[1], portal[2], portal[3])
@@ -261,6 +265,8 @@ class SettingsPage:
                     except (ValueError, OSError) as error:
                         return self._send(400, json.dumps({'error': str(error)}), "application/json")
                 back = {"/setup-flow": "/?view=setup&", "/car": "/?view=car&", "/hotspot": "/?view=hotspot&"}.get(self.path, "/?")
+                if self.path in ('/hotspot-radio', '/hotspot-radio/confirm', '/hotspot-radio/restore'):
+                    back = '/?view=hotspot&'
                 try:
                     result = page.apply(self.path, form)
                 except ValueError as error:
@@ -349,8 +355,17 @@ class SettingsPage:
     # Behaviour -------------------------------------------------------------------------------
 
     def apply(self, path, form):
+        with self.apply_lock:
+            return self._apply(path, form)
+
+    def _apply(self, path, form):
         if self.managed and path not in ("/pair", "/update", "/audio-routes"):
             raise ValueError(f"网络在 {self.managed['by']} 后台设置。")
+        radio_paths = ('/hotspot-radio', '/hotspot-radio/confirm', '/hotspot-radio/restore')
+        if self.radio and path not in radio_paths:
+            data = self.radio.store.snapshot()
+            if data.get('pending') or data.get('restart'):
+                raise ValueError('请先确认或恢复无线设置，再进行其他操作。')
         if path == "/audio-routes":
             self.check_nonce(form)
             # One switch (audio_routes.resolve): "navigation" is the CarPlay-or-not choice; an older viewer that still
@@ -364,6 +379,23 @@ class SettingsPage:
                     routes = self.output_routes(value)
                     self.save_sound_routes(routes)
             return routes
+        if path in radio_paths:
+            self.check_nonce(form)
+            if not self.radio:
+                raise ValueError('此设备不提供无线参数设置。')
+            if path == '/hotspot-radio/restore':
+                self.radio.store.cancel(form.get('transaction', ''))
+                return '正在恢复原设置，请重新连接热点。'
+            reason = self.radio_reason()
+            if reason:
+                raise ValueError(reason)
+            if path == '/hotspot-radio/confirm':
+                self.radio.confirm(form.get('transaction', ''))
+                return '无线设置已保留。'
+            if not self.radio.begin(form):
+                return '无线设置未变化。'
+            self.apply_later('hotspot radio changed')
+            return '正在应用，请重新连接热点后确认保留；3 分钟内未确认将自动恢复。'
         if path == "/pair":
             self.check_nonce(form)
             action = form.get("action")
@@ -1158,7 +1190,24 @@ class SettingsPage:
         box = _load(self.hotspot_file) or {}
         body = (f'<a class=back href="/">‹ 盒子设置</a><h1>盒子热点</h1>{notice}'
                 + ui.hotspot_form(nonce, "/hotspot", box.get("ssid", ""), box.get("passphrase", ""), "保存", self.hotspot_foot()))
+        if self.radio:
+            body += ui.hotspot_radio_form(nonce, self.radio_status())
         return ui.page("盒子热点", body)
+
+    def radio_reason(self):
+        if self.setup().get('mode') != 'box_hotspot':
+            return '请在“车机连盒子热点”方式下调整无线参数。'
+        if (setup_wizard.options(self.state).get('car_internet') == 'phone_hotspot'
+                or self.status().get('uplink', {}).get('phase') in ('connecting', 'online', 'recovering')):
+            return '无线参数跟随手机热点；独立设置需使用 USB 共享网络或关闭手机热点联网。'
+        if self.status().get('debug') or self.status().get('mode') != 'ap':
+            return '盒子热点尚未就绪，请稍后刷新。'
+        return ''
+
+    def radio_status(self):
+        data = self.radio.inspect()
+        data.update(reason=self.radio_reason(), nonce=self.pairing.nonce)
+        return data
 
     def render_car_step(self, setup, notice):
         nonce = self.pairing.nonce
