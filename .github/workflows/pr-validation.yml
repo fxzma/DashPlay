@@ -1,0 +1,50 @@
+name: Independent PR validation
+on:
+  push:
+    branches: [ci/pr-validation-20261101]
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [fix/n1-usb-primary-ap, feature/hotspot-radio-settings]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - name: Linux Python tests
+        env:
+          PYTHONPATH: scripts/onecloud:tests/onecloud
+        run: python -m unittest discover -s tests/onecloud -v
+  tls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/tls-usbmux-diagnostics
+          path: dashplay
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: youcci/playport
+          ref: 9a0882dd0ffe48e467b59d58b12d81391df55ade
+          path: playport
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Apply complete patch series
+        run: sh dashplay/scripts/apply-playport-patches.sh playport
+      - name: Protocol and server tests plus distribution build
+        working-directory: playport
+        run: java -classpath gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain --no-daemon --console=plain :protocol:test :server:test :server:installDist
