@@ -1,0 +1,468 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2UsbMuxHost.kt b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2UsbMuxHost.kt
+index 64c2f06..9f6dbfd 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2UsbMuxHost.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2UsbMuxHost.kt
+@@ -348,6 +348,8 @@ class Iap2UsbMuxTcpConnection internal constructor(
+     private var connected = false
+     private var closed = false
+     private var failure: IphoneUsbException? = null
++    private var diagnosticPackets = 0L
++    private var diagnosticAnomalies = 0L
+ 
+     /** Sends [data] as an ordered byte stream, split into USBMUX TCP payloads of at most 16 KiB. */
+     override fun send(data: ByteArray) {
+@@ -509,6 +511,19 @@ class Iap2UsbMuxTcpConnection internal constructor(
+         if (payload.isNotEmpty()) {
+             synchronized(stateLock) {
+                 if (closed) return
++                diagnosticPackets++
++                if (sequence != nextAcknowledgement) {
++                    diagnosticAnomalies++
++                    // Observe only: preserve the existing ACK and receive queue behavior.
++                    if (diagnosticAnomalies <= 8 || (diagnosticAnomalies and (diagnosticAnomalies - 1)) == 0L) {
++                        runCatching {
++                            Log.w("xcertplay-usb", "usbmux RX sequence anomaly source=$sourcePort destination=$destinationPort " +
++                                "expected=${nextAcknowledgement.toLong() and 0xffffffffL} actual=${sequence.toLong() and 0xffffffffL} " +
++                                "delta=${sequence - nextAcknowledgement} bytes=${payload.size} flags=$flags " +
++                                "anomalies=$diagnosticAnomalies packets=$diagnosticPackets epochMs=${System.currentTimeMillis()}")
++                        }
++                    }
++                }
+                 nextAcknowledgement += payload.size
+                 received.addLast(payload)
+                 stateLock.notifyAll()
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/transport/TlsDuplexChannel.kt b/protocol/src/main/java/com/shilapi/xcertplay/transport/TlsDuplexChannel.kt
+index b7fa6aa..cf375f5 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/TlsDuplexChannel.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/TlsDuplexChannel.kt
+@@ -308,9 +308,14 @@ class TlsDuplexChannel private constructor(
+         val mapped = when (error) {
+             is IphoneUsbException -> error
+             else -> IphoneUsbException.Protocol("TLS channel failed (${error.javaClass.simpleName})")
++                .apply { addSuppressed(error) }
+         }
++        var firstFailure = false
+         val shouldClose = synchronized(stateLock) {
+-            if (failure == null) failure = mapped
++            if (failure == null) {
++                failure = mapped
++                firstFailure = true
++            }
+             if (closed) false else {
+                 closed = true
+                 true
+@@ -323,9 +328,30 @@ class TlsDuplexChannel private constructor(
+                 // Preserve the original failure.
+             }
+         }
++        if (firstFailure) {
++            // Keep diagnostics bounded and never let logging change transport cleanup.
++            runCatching { Log.w("xcertplay-usb", failureDiagnostic(error)) }
++        }
+         return synchronized(stateLock) { failure ?: mapped }
+     }
+ 
++    private fun failureDiagnostic(error: Exception): String = buildString {
++        append("TLS failure original=${error.javaClass.name} source=${(underlying as? Iap2UsbMuxTcpConnection)?.sourcePort ?: -1} epochMs=${System.currentTimeMillis()}")
++        var current: Throwable? = error
++        var depth = 0
++        while (current != null && depth < 4) {
++            val cause = current
++            val message = cause.message.orEmpty().take(512).map { if (it.isISOControl()) ' ' else it }.joinToString("")
++            append("\ncause[$depth]=${cause.javaClass.name} message=$message")
++            val frames = cause.stackTrace
++            frames.take(12).forEach { append("\n at $it") }
++            if (frames.size > 12) append("\n [stack truncated]")
++            current = cause.cause
++            depth++
++        }
++        if (current != null) append("\n [cause chain truncated]")
++    }
++
+     private fun grow(capacity: Int): Int {
+         if (capacity >= MAXIMUM_TLS_BUFFER_BYTES) return MAXIMUM_TLS_BUFFER_BYTES + 1
+         return minOf(MAXIMUM_TLS_BUFFER_BYTES, capacity * 2)
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/transport/TransportDiagnosticsTest.java b/protocol/src/test/java/com/shilapi/xcertplay/transport/TransportDiagnosticsTest.java
+new file mode 100644
+index 0000000..c7bb61a
+--- /dev/null
++++ b/protocol/src/test/java/com/shilapi/xcertplay/transport/TransportDiagnosticsTest.java
+@@ -0,0 +1,378 @@
++package com.shilapi.xcertplay.transport;
++
++import org.junit.Test;
++import java.io.ByteArrayOutputStream;
++import java.io.PrintStream;
++import java.lang.reflect.Constructor;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.lang.reflect.Proxy;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicInteger;
++import javax.crypto.AEADBadTagException;
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLEngine;
++import javax.net.ssl.SSLException;
++
++/**
++ * Runs against the actual protocol JAR, with in-memory pipes and no device or worker thread.
++ * The existing exception wrapper initializes its cause to null; the original TLS exception
++ * is retained as one suppressed attachment, preserving that exception's own cause chain.
++ */
++public class TransportDiagnosticsTest {
++    private static final String PACKAGE = "com.shilapi.xcertplay.transport.";
++    private static final ByteArrayOutputStream LOG = new ByteArrayOutputStream();
++
++    private static void require(boolean condition, String message) {
++        if (!condition) throw new AssertionError(message);
++    }
++
++    private static Object call(Method method, Object receiver, Object... args) throws Exception {
++        try { return method.invoke(receiver, args); }
++        catch (InvocationTargetException exception) {
++            Throwable cause = exception.getCause();
++            if (cause instanceof Exception) throw (Exception) cause;
++            if (cause instanceof Error) throw (Error) cause;
++            throw exception;
++        }
++    }
++
++    private static Method method(Class<?> type, String name, int parameters) {
++        for (Method candidate : type.getDeclaredMethods()) {
++            if ((candidate.getName().equals(name) || candidate.getName().startsWith(name + "$"))
++                    && candidate.getParameterCount() == parameters) {
++                candidate.setAccessible(true);
++                return candidate;
++            }
++        }
++        throw new AssertionError("Method not found: " + type.getName() + "." + name);
++    }
++
++    private static String logs() { return LOG.toString(StandardCharsets.UTF_8).replace("\r\n", "\n"); }
++    private static long anomalyLines() {
++        return logs().lines().filter(line -> line.contains("usbmux RX sequence anomaly")).count();
++    }
++
++    private static final class TlsCase {
++        final AtomicInteger closes = new AtomicInteger();
++        final Object channel;
++        final Method fail;
++
++        TlsCase() throws Exception {
++            Class<?> stream = Class.forName(PACKAGE + "BlockingDuplexByteStream");
++            Object pipe = Proxy.newProxyInstance(stream.getClassLoader(), new Class<?>[]{stream},
++                    (proxy, called, arguments) -> {
++                        if (called.getName().equals("close")) closes.incrementAndGet();
++                        return null;
++                    });
++            Class<?> type = Class.forName(PACKAGE + "TlsDuplexChannel");
++            Constructor<?> constructor = type.getDeclaredConstructor(stream, SSLEngine.class);
++            constructor.setAccessible(true);
++            channel = constructor.newInstance(pipe, SSLContext.getDefault().createSSLEngine());
++            fail = method(type, "fail", 1);
++        }
++
++        Throwable fail(Exception error) throws Exception { return (Throwable) call(fail, channel, error); }
++    }
++
++    private static void tlsCauseAndSingleReport() throws Exception {
++        Class<?> stream = Class.forName(PACKAGE + "BlockingDuplexByteStream");
++        AtomicInteger closes = new AtomicInteger();
++        Object pipe = Proxy.newProxyInstance(stream.getClassLoader(), new Class<?>[]{stream},
++                (proxy, called, arguments) -> {
++                    if (called.getName().equals("close")) closes.incrementAndGet();
++                    return null;
++                });
++        Class<?> type = Class.forName(PACKAGE + "TlsDuplexChannel");
++        Constructor<?> constructor = type.getDeclaredConstructor(stream, SSLEngine.class);
++        constructor.setAccessible(true);
++        Object channel = constructor.newInstance(pipe, SSLContext.getDefault().createSSLEngine());
++        Method fail = method(type, "fail", 1);
++        AEADBadTagException inner = new AEADBadTagException("synthetic authentication mismatch");
++        SSLException original = new SSLException("synthetic TLS record failure", inner);
++        original.setStackTrace(new StackTraceElement[]{
++                new StackTraceElement("SyntheticTlsReader", "unwrap", "SyntheticTlsReader.java", 73)});
++        LOG.reset();
++        Throwable mapped = (Throwable) call(fail, channel, original);
++        require(mapped.getSuppressed().length == 1 && mapped.getSuppressed()[0] == original,
++                "TLS wrapper discarded the original exception attachment");
++        require(mapped.getSuppressed()[0].getCause() == inner, "TLS wrapper discarded the nested cause");
++        require(closes.get() == 1, "TLS failure must close the owned pipe once");
++        String first = logs();
++        require(first.contains("SSLException") && first.contains("synthetic TLS record failure"),
++                "TLS type or original message not observable");
++        require(first.contains("AEADBadTagException") && first.contains("synthetic authentication mismatch"),
++                "Nested TLS cause not observable");
++        require(first.contains("SyntheticTlsReader.unwrap") && first.contains(":73"),
++                "TLS original stack not observable");
++        Throwable again = (Throwable) call(fail, channel, new SSLException("secondary closure"));
++        require(again == mapped, "Subsequent failure replaced the first failure");
++        require(closes.get() == 1, "Subsequent failure closed the pipe twice");
++        require(logs().equals(first), "Subsequent failure logged a duplicate diagnostic");
++    }
++
++    private static void tlsBounded() throws Exception {
++        TlsCase test = new TlsCase();
++        SSLException[] chain = new SSLException[6];
++        String message = "synthetic\nFAKE_HEADER\r\t" + "x".repeat(900) + "UNLOGGED_TAIL";
++        for (int depth = 0; depth < chain.length; depth++) {
++            chain[depth] = new SSLException(message);
++            StackTraceElement[] frames = new StackTraceElement[20];
++            for (int frame = 0; frame < frames.length; frame++) {
++                frames[frame] = new StackTraceElement("SyntheticTlsReader" + depth, "frame" + frame,
++                        "SyntheticTlsReader.java", 10 + frame);
++            }
++            chain[depth].setStackTrace(frames);
++        }
++        for (int i = 0; i < chain.length - 1; i++) chain[i].initCause(chain[i + 1]);
++        LOG.reset();
++        Throwable mapped = test.fail(chain[0]);
++        require(mapped.getSuppressed().length == 1 && mapped.getSuppressed()[0] == chain[0]
++                        && chain[0].getMessage().equals(message),
++                "Bounded diagnostic changed the original exception");
++        String text = logs();
++        require(text.contains("cause[3]") && !text.contains("cause[4]"), "Cause depth not bounded at four");
++        require(text.contains("SyntheticTlsReader0.frame11") && !text.contains("SyntheticTlsReader0.frame12"),
++                "Stack frame count not bounded at twelve");
++        require(text.contains("cause chain truncated") && text.contains("stack truncated"),
++                "Diagnostic truncation not visible");
++        require(!text.contains("UNLOGGED_TAIL") && !text.contains("x".repeat(513)),
++                "Long exception message not bounded");
++        require(!text.contains("\nFAKE_HEADER") && !text.contains("\r") && !text.contains("\t"),
++                "Exception message injected log control characters");
++        require(text.length() < 10000, "Bounded diagnostic unexpectedly large");
++        require(test.closes.get() == 1, "Bounded diagnostic changed transport cleanup");
++    }
++
++    private static void tlsCycle() throws Exception {
++        TlsCase test = new TlsCase();
++        SSLException first = new SSLException("synthetic cycle first");
++        SSLException second = new SSLException("synthetic cycle second");
++        first.initCause(second);
++        second.initCause(first);
++        LOG.reset();
++        Throwable mapped = test.fail(first);
++        require(mapped.getSuppressed().length == 1 && mapped.getSuppressed()[0] == first,
++                "Cyclic original exception attachment lost");
++        require(logs().contains("cause chain truncated") && !logs().contains("cause[4]"),
++                "Cyclic cause did not terminate at diagnostic bound");
++        require(test.closes.get() == 1, "Cyclic cause prevented cleanup");
++    }
++
++    private static void tlsDiagnosticFailure() throws Exception {
++        TlsCase test = new TlsCase();
++        SSLException original = new SSLException("synthetic formatter failure") {
++            @Override public String getMessage() { throw new IllegalStateException("synthetic message failure"); }
++        };
++        Throwable mapped = test.fail(original);
++        require(mapped.getSuppressed().length == 1 && mapped.getSuppressed()[0] == original,
++                "Diagnostic formatter failure hid original exception attachment");
++        require(test.closes.get() == 1, "Diagnostic formatter failure prevented cleanup");
++        require(test.fail(new SSLException("second failure")) == mapped, "Diagnostic failure lost first-error state");
++    }
++
++    private static final class Connection {
++        final List<byte[]> writes = new ArrayList<>();
++        final Object connection;
++        final Method packet;
++        final Method recv;
++        int expected;
++
++        Connection(int firstSequence) throws Exception {
++            Class<?> pipeType = Class.forName(PACKAGE + "Iap2UsbSession");
++            Object pipe = Proxy.newProxyInstance(pipeType.getClassLoader(), new Class<?>[]{pipeType},
++                    (proxy, called, arguments) -> {
++                        if (called.getName().equals("write")) writes.add(((byte[]) arguments[0]).clone());
++                        return null;
++                    });
++            Class<?> hostType = Class.forName(PACKAGE + "Iap2UsbMuxHost");
++            Constructor<?> hostConstructor = hostType.getDeclaredConstructor(pipeType, long.class);
++            hostConstructor.setAccessible(true);
++            Object host = hostConstructor.newInstance(pipe, 100L);
++            Class<?> connectionType = Class.forName(PACKAGE + "Iap2UsbMuxTcpConnection");
++            Constructor<?> connectionConstructor = connectionType.getDeclaredConstructor(hostType, int.class, int.class);
++            connectionConstructor.setAccessible(true);
++            connection = connectionConstructor.newInstance(host, 2, 63280);
++            packet = method(connectionType, "onPacket", 3);
++            recv = method(connectionType, "recv", 2);
++            expected = firstSequence;
++            call(packet, connection, 0x12, firstSequence - 1, new byte[0]);
++            require(writes.size() == 1, "SYN/ACK must produce one ACK");
++            assertAck(firstSequence, 0x10);
++        }
++
++        void assertAck(int acknowledgement, int flags) {
++            byte[] frame = writes.get(writes.size() - 1);
++            require(frame.length == 36, "ACK framing changed");
++            require(readInt(frame, 0) == 6, "ACK no longer uses USBMUX TCP");
++            require(readInt(frame, 24) == acknowledgement,
++                    "ACK changed: expected " + Integer.toUnsignedString(acknowledgement)
++                            + " actual " + Integer.toUnsignedString(readInt(frame, 24)));
++            require((frame[29] & 0xff) == flags, "ACK flags changed");
++        }
++
++        void payload(int sequence, byte[] data) throws Exception {
++            int previousWrites = writes.size();
++            call(packet, connection, 0x10, sequence, data);
++            expected += data.length;
++            require(writes.size() == previousWrites + 1, "Diagnostic changed ACK count");
++            assertAck(expected, 0x10);
++            byte[] received = (byte[]) call(recv, connection, 4096, 5L);
++            require(Arrays.equals(data, received), "Diagnostic changed queued payload bytes");
++        }
++
++        void control(int flags, int sequence) throws Exception {
++            call(packet, connection, flags, sequence, new byte[0]);
++        }
++    }
++
++    private static int readInt(byte[] bytes, int offset) {
++        return ((bytes[offset] & 255) << 24) | ((bytes[offset + 1] & 255) << 16)
++                | ((bytes[offset + 2] & 255) << 8) | (bytes[offset + 3] & 255);
++    }
++
++    private static void checkAnomaly(int expected, int actual, int length) {
++        require(anomalyLines() == 1, "Expected exactly one sequence anomaly, got: " + logs());
++        String text = logs();
++        require(text.contains("expected=" + Integer.toUnsignedString(expected)), "Missing expected sequence");
++        require(text.contains("actual=" + Integer.toUnsignedString(actual)), "Missing actual sequence");
++        require(text.contains("bytes=" + length), "Missing payload length");
++        require(text.contains("flags=16"), "Missing packet flags");
++        require(!text.contains("SYNTHETIC_PAYLOAD_DO_NOT_LOG"), "Diagnostic exposed payload");
++    }
++
++    private static void normal() throws Exception {
++        Connection connection = new Connection(100);
++        LOG.reset();
++        connection.payload(100, new byte[]{1, 2, 3, 4});
++        connection.payload(104, new byte[]{5, 6});
++        connection.control(0x10, 0);
++        require(anomalyLines() == 0, "Normal stream or empty ACK reported as sequence anomaly");
++    }
++
++    private static void duplicate() throws Exception {
++        Connection connection = new Connection(100);
++        byte[] bytes = "SYNTHETIC_PAYLOAD_DO_NOT_LOG".getBytes(StandardCharsets.UTF_8);
++        connection.payload(100, bytes);
++        LOG.reset();
++        connection.payload(100, bytes);
++        checkAnomaly(100 + bytes.length, 100, bytes.length);
++    }
++
++    private static void gap() throws Exception {
++        Connection connection = new Connection(100);
++        LOG.reset();
++        connection.payload(150, new byte[]{1, 2, 3});
++        checkAnomaly(100, 150, 3);
++    }
++
++    private static void overlap() throws Exception {
++        Connection connection = new Connection(100);
++        connection.payload(100, new byte[8]);
++        LOG.reset();
++        connection.payload(104, new byte[8]);
++        checkAnomaly(108, 104, 8);
++    }
++
++    private static void wrap() throws Exception {
++        Connection connection = new Connection(0xfffffffd);
++        LOG.reset();
++        connection.payload(0xfffffffd, new byte[5]);
++        connection.payload(2, new byte[4]);
++        require(anomalyLines() == 0, "32-bit sequence wrap produced a false anomaly");
++        connection.payload(10, new byte[3]);
++        checkAnomaly(6, 10, 3);
++    }
++
++    private static void throttling() throws Exception {
++        Connection connection = new Connection(100);
++        LOG.reset();
++        for (int count = 1; count <= 32; count++) {
++            connection.payload(connection.expected + 9, new byte[]{1});
++            long expectedLines = Math.min(count, 8) + (count >= 16 ? 1 : 0) + (count >= 32 ? 1 : 0);
++            require(anomalyLines() == expectedLines, "Unexpected log volume at anomaly " + count);
++        }
++        require(logs().contains("anomalies=32"), "Suppressed anomalies missing from cumulative counter");
++    }
++
++    private static void muxLogFailure() throws Exception {
++        Connection connection = new Connection(100);
++        PrintStream normalError = System.err;
++        AtomicInteger failedWrites = new AtomicInteger();
++        PrintStream failedOutput = new PrintStream(new ByteArrayOutputStream()) {
++            private void failWrite() {
++                failedWrites.incrementAndGet();
++                throw new IllegalStateException("synthetic log failure");
++            }
++            @Override public void println(String text) { failWrite(); }
++            @Override public void println(Object value) { failWrite(); }
++            @Override public void print(String text) { failWrite(); }
++            @Override public void write(byte[] bytes, int offset, int length) {
++                failWrite();
++            }
++        };
++        try {
++            System.setErr(failedOutput);
++            connection.payload(200, new byte[]{1, 2, 3});
++        } finally {
++            System.setErr(normalError);
++        }
++        require(failedWrites.get() > 0, "Test did not exercise the failing log output");
++        connection.payload(connection.expected, new byte[]{4, 5});
++    }
++
++    private static void runCase(String name) throws Exception {
++        PrintStream originalError = System.err;
++        System.setProperty("org.slf4j.simpleLogger.cacheOutputStream", "false");
++        System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "info");
++        System.setErr(new PrintStream(LOG, true, StandardCharsets.UTF_8));
++        try {
++            switch (name) {
++                case "tls": tlsCauseAndSingleReport(); break;
++                case "tls-bounded": tlsBounded(); break;
++                case "tls-cycle": tlsCycle(); break;
++                case "tls-diagnostic-failure": tlsDiagnosticFailure(); break;
++                case "normal": normal(); break;
++                case "duplicate": duplicate(); break;
++                case "gap": gap(); break;
++                case "overlap": overlap(); break;
++                case "wrap": wrap(); break;
++                case "throttle": throttling(); break;
++                case "mux-log-failure": muxLogFailure(); break;
++                default: throw new IllegalArgumentException("Unknown case " + name);
++            }
++            System.out.println("PASS " + name);
++        } catch (Throwable error) {
++            System.setErr(originalError);
++            System.err.print(logs());
++            throw error;
++        } finally {
++            System.setErr(originalError);
++        }
++    }
++
++    @Test public void tlsRetainsCauseAndClosesOnce() throws Exception { runCase("tls"); }
++
++    @Test public void tlsBoundsDiagnostics() throws Exception { runCase("tls-bounded"); }
++
++    @Test public void tlsBoundsCauseCycles() throws Exception { runCase("tls-cycle"); }
++
++    @Test public void tlsDiagnosticFailurePreservesCleanup() throws Exception { runCase("tls-diagnostic-failure"); }
++
++    @Test public void normalSequenceIsQuiet() throws Exception { runCase("normal"); }
++
++    @Test public void duplicateIsObservedOnly() throws Exception { runCase("duplicate"); }
++
++    @Test public void gapIsObservedOnly() throws Exception { runCase("gap"); }
++
++    @Test public void overlapIsObservedOnly() throws Exception { runCase("overlap"); }
++
++    @Test public void sequenceWrapIsHandled() throws Exception { runCase("wrap"); }
++
++    @Test public void anomaliesAreRateLimited() throws Exception { runCase("throttle"); }
++
++    @Test public void logFailurePreservesPayloadAndAck() throws Exception { runCase("mux-log-failure"); }
++}
