@@ -947,11 +947,16 @@ class DebianPlatform:
 
     def finish_usb_tether(self):
         """Profiles, forwarding and NAT for the sharing [begin_usb_tether] announced."""
+        from setup_wizard import save_json
         try:
             saved = json.loads((self.run / 'usb-tether.json').read_text())
             network = ipaddress.ip_network(saved['network'])
         except (OSError, ValueError, KeyError):
             raise ValueError('USB 共享网络未准备好，请稍后重试。') from None
+        # The persistent phone uplink can create ap0 between begin and finish.
+        # Journal the interface used by the rules, including partial failures.
+        saved['interface'] = self.ap_interface
+        save_json(self.run / 'usb-tether.json', saved)
         self._usb_tether_rules_for(network)
 
     def enable_usb_tether(self, network):
@@ -961,7 +966,7 @@ class DebianPlatform:
         systemd-networkd then takes the lease and the route when the iPhone is plugged in and drops them when it
         is unplugged, so nothing here follows the cable. Journalled in usb-tether.json for stop_usb_sharing."""
         self.begin_usb_tether(network)
-        self._usb_tether_rules_for(network)
+        self.finish_usb_tether()
 
     def _usb_tether_rules_for(self, network):
         # Only the manager the image runs: with both, NetworkManager and networkd each took a lease on the

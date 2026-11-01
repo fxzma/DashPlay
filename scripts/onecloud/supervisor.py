@@ -162,8 +162,14 @@ def hotspot_names(state, own_name, use):
     chosen = options(state)
     if use != "box_hotspot":
         return []
-    checks = list(setup_wizard.TESLA_CHECK_NAMES) if chosen.get("tesla") else []
+    checks = list(setup_wizard.TESLA_CHECK_NAMES) if chosen.get("tesla") and chosen.get("car_internet") != "usb_tether" else []
     return checks + ([own_name] if own_name and setup_wizard.answers_own_name(chosen, own_domain.load(state)) else [])
+
+
+def primary_usb_ap(platform):
+    """Keep the N1 Broadcom primary BSS until a phone station is actually needed."""
+    return (board_phicomm_n1.is_n1() and
+            (Path('/sys/class/net') / platform.interface / 'device/driver').resolve().name == 'brcmfmac')
 
 
 def hotspot_router(state, use):
@@ -596,6 +602,7 @@ def main():
                 # usb_tether shares the uplink with the car (share=True) and keeps the AP while it joins.
                 uplink = PhoneUplink(platform, state, address, hotspot, channel, width, wait_for,
                                      launch_receiver, status, share=wants_usb_tether,
+                                     primary_ap=wants_usb_tether and primary_usb_ap(platform),
                                      say=lambda line: print(line, flush=True))
                 if not uplink.start():
                     uplink = None

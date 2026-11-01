@@ -907,6 +907,23 @@ class UsbTetherPlatformTests(unittest.TestCase):
 
     nm_running = False
 
+    def test_two_phase_usb_records_actual_ap_for_cleanup(self):
+        with patch('platform_debian.subprocess.run', side_effect=self.run_fake) as run:
+            self.p.begin_usb_tether(ipaddress.ip_network('100.96.0.0/24'))
+            self.p.ap_interface = 'ap0'
+            self.p.finish_usb_tether()
+            saved = json.loads((self.root / 'usb-tether.json').read_text())
+            self.assertEqual(saved['interface'], 'ap0')
+            self.p.ap_interface = 'wlan-test'  # phone-uplink cleanup removed ap0 first
+            self.p.stop_usb_sharing()
+        commands = [c.args[0] for c in run.call_args_list]
+        inserted = [c for c in commands if c[0] == 'iptables' and '-I' in c]
+        removed = [c for c in commands if c[0] == 'iptables' and '-D' in c]
+        self.assertEqual(sorted([['-D' if arg == '-I' else arg for arg in c] for c in inserted]), sorted(removed))
+        self.assertEqual(self.p.ap_interface, 'wlan-test')
+        self.assertIn(['sysctl', '-w', 'net.ipv4.ip_forward=0'], commands)
+
+
     def run_fake(self, *args, **kwargs):
         if args[0][:2] == ['systemctl', 'is-active']:
             return subprocess.CompletedProcess(args[0], 0 if self.nm_running else 3, '', '')

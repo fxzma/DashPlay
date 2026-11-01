@@ -266,13 +266,16 @@ class PhoneUplink:
     so an autonomous reconnect cannot silently move the AP to another channel.
     """
     def __init__(self, platform, state, address, box, offline_channel, offline_width,
-                 wait_for, start_receiver, status, say=print, clock=time.monotonic, share=False):
+                 wait_for, start_receiver, status, say=print, clock=time.monotonic, share=False, primary_ap=False):
         self.platform, self.state, self.address, self.box = platform, Path(state), address, box
         self.channel, self.width = offline_channel, offline_width
         # share: the box is the car's router and forwards whichever uplink is up. "USB 共享网络" uses it so the
         # car keeps the port when the cable is unplugged and the saved phone hotspot takes over (2026-10-31).
         self.share = share
+        self.primary_ap = bool(primary_ap and share)
+        self.primary_active = False
         self.default_channel = offline_channel
+        self.default_width = offline_width
         self.wait_for, self.start_receiver, self.status = wait_for, start_receiver, status
         self.say, self.clock = say, clock
         self.saved = hotspot(state)
@@ -310,7 +313,7 @@ class PhoneUplink:
         return [name] if name and enabled else []
 
     def local_names(self):
-        checks = list(setup_wizard.TESLA_CHECK_NAMES) if self.status.get('tesla') else []
+        checks = list(setup_wizard.TESLA_CHECK_NAMES) if self.status.get('tesla') and not self.share else []
         return checks + self.own_names()
 
     def scan(self):
@@ -342,10 +345,11 @@ class PhoneUplink:
         return 14 if frequency == 2484 else ((frequency - 2407) // 5 if frequency < 3000
                                             else (frequency - 5000) // 5)
 
-    def configure_ap(self, channel):
+    def configure_ap(self, channel, width=20, following=True):
         p = self.platform
-        p.configure_hotspot(channel, 20, self.box['ssid'], self.box['passphrase'])
-        p.n_only_ap()
+        p.configure_hotspot(channel, width, self.box['ssid'], self.box['passphrase'])
+        if following:
+            p.n_only_ap()
         for _ in range(2):
             if p.start_ap(self.wait_for):
                 self.channel = channel
@@ -357,6 +361,14 @@ class PhoneUplink:
     def start(self):
         """False means partial LAN ownership was cleared; supervisor can start an ordinary AP."""
         p = self.platform
+        if self.primary_ap:
+            self.start_primary_lan()
+            self.started = True
+            cable = self.cable_present()
+            self.set_status('wired' if cable else 'offline',
+                            '已接有线网络；局域网保持可用' if cable else '盒子热点就绪；后台寻找手机热点')
+            self.next_try = self.clock() + SHARE_START_GRACE
+            return True
         try:
             capable = bool(self.saved and p.concurrent_ap())
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -421,6 +433,69 @@ class PhoneUplink:
             self.connect(frequency)
         return self.started
 
+    def start_primary_lan(self, finish_usb=False):
+        """The N1 can serve its primary BSS while no phone station is connected."""
+        p = self.platform
+        p.set_ap_address(self.address)
+        self.configure_ap(self.default_channel, self.default_width, False)
+        p.set_phone_dns(None)
+        p.start_dhcp(self.address, False, self.local_names(), router=True,
+                     query_log=self.state / 'diag/tesla-dns.log' if self.status.get('tesla') else None,
+                     upstream_file=p.phone_resolv)
+        if finish_usb:
+            p.finish_usb_tether()
+        self.start_receiver(self.channel)
+        p.check_lan_children()
+        self.primary_active = True
+        self.status['tesla_lan_stable'] = True
+
+    def replace_usb_lan(self, primary, channel=None):
+        """Move all LAN ownership together; failed concurrent setup returns to the primary AP."""
+        p = self.platform
+        self.started = False
+        self.status['tesla_lan_stable'] = False
+        try:
+            for child in ('receiver', 'dnsmasq', 'hostapd'):
+                p.stop_child(child)
+            p.stop_usb_sharing()
+            if self.prepared:
+                # Removing the network file alone can leave networkd's DHCP client alive.
+                # Keep a failed stop inside this transaction, never the read-only tick guard.
+                p.stop_phone_station()
+                p.cleanup_phone_uplink()
+            self.prepared = self.station = False
+            self.frequency = self.gateway = self.loss_since = self.connect_since = None
+            self.status.pop('uplink_link', None)
+            p.flush_address()
+            p.begin_usb_tether(self.address.network)
+            if primary:
+                self.start_primary_lan(finish_usb=True)
+            else:
+                self.prepared = True
+                p.prepare_phone_uplink()
+                if not p.add_phone_ap():
+                    raise RuntimeError('cannot create phone AP')
+                p.set_ap_address(self.address)
+                self.configure_ap(channel, 20, True)
+                p.set_phone_dns(None)
+                p.start_dhcp(self.address, False, self.local_names(), router=True,
+                             query_log=self.state / 'diag/tesla-dns.log' if self.status.get('tesla') else None,
+                             upstream_file=p.phone_resolv)
+                # Official USB rules follow the actual default route, including Wi-Fi.
+                p.finish_usb_tether()
+                self.start_receiver(self.channel)
+                p.check_lan_children()
+                self.primary_active = False
+        except NETWORK_ERRORS as error:
+            if primary:
+                raise LanRecoveryFailed('primary USB LAN recovery failed: ' + type(error).__name__) from None
+            self.replace_usb_lan(True)
+            return False
+        self.started = True
+        self.status['tesla_lan_stable'] = True
+        self.ap_misses = 0
+        return True
+
     def clear_lan(self):
         """Clear all partial LAN ownership before allowing the ordinary AP path to run."""
         self.started = False
@@ -445,6 +520,9 @@ class PhoneUplink:
 
     def restore_plain_ap(self):
         """Last local recovery. On success the supervisor resumes ordinary child monitoring."""
+        if self.primary_ap:
+            self.replace_usb_lan(True)
+            return
         try:
             self.clear_lan()
             start_shared_ap(self.platform, self.address, self.box, self.default_channel, 20,
@@ -487,7 +565,10 @@ class PhoneUplink:
                    for device in devices)
 
     def defer(self, reason):
-        self.disconnect_station()
+        if self.primary_ap and not self.primary_active:
+            self.replace_usb_lan(True)
+        else:
+            self.disconnect_station()
         self.set_status('offline', reason)
         self.next_try = self.clock() + self.search.delay()
 
@@ -529,6 +610,10 @@ class PhoneUplink:
             return
         try:
             channel = self.channel_of(frequency)
+            if self.primary_ap and self.primary_active:
+                if not self.replace_usb_lan(False, channel):
+                    self.defer('上联连接失败；已恢复盒子热点，稍后重试')
+                    return
             if channel != self.channel:
                 self.disconnect_station()
                 self.say(f'phone uplink channel change: {self.channel} -> {channel}; rebuilding AP')
@@ -556,8 +641,11 @@ class PhoneUplink:
         self.ap_misses = 0 if p.ap_ready() else self.ap_misses + 1
         if self.ap_misses >= AP_READY_MISSES:
             self.ap_misses = 0
-            self.disconnect_station()
-            self.rebuild_ap(self.channel)
+            if self.primary_ap:
+                self.replace_usb_lan(True)
+            else:
+                self.disconnect_station()
+                self.rebuild_ap(self.channel)
             if not self.started:
                 return
             self.set_status('offline', '盒子热点已恢复；后台重连上游')
@@ -565,6 +653,11 @@ class PhoneUplink:
             self.next_try = self.clock() + self.search.delay()
             return
         try:
+            if self.primary_ap and not self.primary_active and self.cable_present():
+                self.replace_usb_lan(True)
+                self.set_status('wired', '已接 USB 共享网络；改用数据线供网')
+                self.next_try = self.clock() + WIRED_RECHECK
+                return
             if self.station:
                 if self.share and self.cable_present():
                     # USB 共享网络: the cable (or Ethernet) is the first choice, the joined hotspot only the
@@ -618,10 +711,12 @@ class PhoneUplink:
                 # The cable is the uplink now. An AP left on the hotspot's 2.4 GHz channel makes CarPlay
                 # stutter and nothing needs that channel any more (2026-10-31: plugging Ethernet after the
                 # hotspot had already dropped kept the AP on channel 3).
-                if self.share and self.channel <= 14:
+                if self.share and not self.primary_ap and self.channel <= 14:
                     self.rebuild_ap(self.default_channel)
                 self.set_status('wired', '已接有线网络；局域网保持可用')
                 self.next_try = self.clock() + WIRED_RECHECK
+                return
+            if not self.saved:
                 return
             frequency = self.scan()
             if frequency:
@@ -638,6 +733,8 @@ class PhoneUplink:
 
     def close(self):
         self.status['tesla_lan_stable'] = False
+        if self.primary_ap:
+            self.platform.stop_usb_sharing()
         if self.prepared:
             self.platform.cleanup_phone_uplink()
         self.prepared = self.started = False
